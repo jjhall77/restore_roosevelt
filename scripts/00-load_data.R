@@ -1,27 +1,138 @@
-#00- load data & creat ebuffer
+#-------------------------------------------------
+# 00 — Load data + make sf versions (EPSG:2263)
+#-------------------------------------------------
 
-
+library(here)
 library(tidyverse)
 library(janitor)
 library(lubridate)
 library(sf)
 
-setwd("~/Documents/Research_Projects/Roosevelt_Ave/scripts")
-source('../lib/helpers.R')
+#-------------------------------------------------
+# List files
+#-------------------------------------------------
+list.files(here("data"))
+
+#-------------------------------------------------
+# LION 
+#-------------------------------------------------
+# Path to the geodatabase
+lion_gdb <- here("data", "lion", "lion.gdb")
+
+# List available layers inside the .gdb
+st_layers(lion_gdb)
+
+lion_gdb <- here("data", "lion", "lion.gdb")
+
+lion <- st_read(lion_gdb, layer = "lion") %>%
+  st_transform(2263) %>% 
+  clean_names() # NYC coordinates, ft
+#-------------------------------------------------
+# Spatial boundary files (already 2263; enforce)
+#-------------------------------------------------
+nycb <- st_read(here("data", "nycb2020_25d"), quiet = TRUE) |>
+  st_transform(2263) |>
+  clean_names()
+
+nyct <- st_read(here("data", "nyct2020_25d"), quiet = TRUE) |>
+  st_transform(2263) |>
+  clean_names()
+
+nynta <- st_read(here("data", "nynta2020_25d"), quiet = TRUE) |>
+  st_transform(2263) |>
+  clean_names()
+
+#-------------------------------------------------
+# CSV reader
+#-------------------------------------------------
+read_clean_csv <- function(file) {
+  readr::read_csv(here("data", file), show_col_types = FALSE) |>
+    clean_names()
+}
+
+#-------------------------------------------------
+# Load CSVs
+#-------------------------------------------------
+arrests <- bind_rows(
+  read_clean_csv("NYPD_Arrests_Data_(Historic)_20251214.csv"),
+  read_clean_csv("NYPD_Arrest_Data_(Year_to_Date)_20251214.csv")
+)
+
+directed_patrols <- bind_rows(
+  read_clean_csv("NYPD_Calls_for_Service_(Historic)_20251214.csv") |>
+    mutate(incident_time = as.character(incident_time)),
+  read_clean_csv("NYPD_Calls_for_Service_(Year_to_Date)_20251214.csv") |>
+    mutate(incident_time = as.character(incident_time))
+)
+
+complaints <- bind_rows(
+  read_clean_csv("NYPD_Complaint_Data_Historic_20251214.csv") |>
+    mutate(housing_psa = as.character(housing_psa)),
+  read_clean_csv("NYPD_Complaint_Data_Current_(Year_To_Date)_20251214.csv") |>
+    mutate(housing_psa = as.character(housing_psa))
+)
+
+criminal_court_summons <- read_clean_csv("NYPD_Criminal_Court_Summons_(Historic)_20251214.csv")
+
+oath_summons <- read_clean_csv("NYPD_OATH_Summons_Data_20251214.csv")
+
+precincts <- read_clean_csv("nypd_precinct_locations.csv")
+
+#-------------------------------------------------
+# Make sf versions (EPSG:2263)
+#-------------------------------------------------
+
+# Arrests: authoritative NYPD X/Y (2263)
+arrests_sf <- arrests |>
+  filter(!is.na(x_coord_cd), !is.na(y_coord_cd)) |>
+  st_as_sf(coords = c("x_coord_cd", "y_coord_cd"), crs = 2263, remove = FALSE)
+
+# Calls for Service: authoritative X/Y (geo_cd_x, geo_cd_y) (2263)
+directed_patrols_sf <- directed_patrols |>
+  filter(!is.na(geo_cd_x), !is.na(geo_cd_y)) |>
+  st_as_sf(coords = c("geo_cd_x", "geo_cd_y"), crs = 2263, remove = FALSE)
+
+# Complaints: authoritative NYPD X/Y (2263)
+complaints_sf <- complaints |>
+  filter(!is.na(x_coord_cd), !is.na(y_coord_cd)) |>
+  st_as_sf(coords = c("x_coord_cd", "y_coord_cd"), crs = 2263, remove = FALSE)
+
+# Criminal Court Summonses: authoritative X/Y (2263)
+criminal_court_summons_sf <- criminal_court_summons |>
+  filter(!is.na(x_coordinate_cd), !is.na(y_coordinate_cd)) |>
+  st_as_sf(coords = c("x_coordinate_cd", "y_coordinate_cd"), crs = 2263, remove = FALSE)
+
+# OATH Summonses: X/Y are character → numeric → sf (2263)
+oath_summons_sf <- oath_summons |>
+  mutate(
+    x_coord_cd = as.numeric(x_coord_cd),
+    y_coord_cd = as.numeric(y_coord_cd)
+  ) |>
+  filter(!is.na(x_coord_cd), !is.na(y_coord_cd)) |>
+  st_as_sf(coords = c("x_coord_cd", "y_coord_cd"), crs = 2263, remove = FALSE)
+
+# Precincts: lat/long → sf (4326) → transform to 2263
+precincts_sf <- precincts |>
+  filter(!is.na(longitude), !is.na(latitude)) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) |>
+  st_transform(2263)
+
+#-------------------------------------------------
+# Quick CRS checks
+#-------------------------------------------------
+st_crs(arrests_sf)
+st_crs(directed_patrols_sf)
+st_crs(complaints_sf)
+st_crs(criminal_court_summons_sf)
+st_crs(oath_summons_sf)
+st_crs(precincts_sf)
+
+
 
 #create zone
 
-#roads
-roads <- st_read(dsn= "../data/lion/lion.gdb", layer = "lion", stringsAsFactors = F)
-#roads$BikeLane <- str_trim(roads$BikeLane, "both")
-roads <- roads %>%
-  clean_names() %>%
-  filter(feature_typ %in% c('0','W')) %>%
-  st_set_crs(2263) %>%
-  filter(!st_geometry_type(.) %in% c("MULTICURVE"))
-
 # Filter out unwanted street types and intersect with pct110_115 as before
-roads_filtered <- roads %>%
+roads_filtered <- lion %>%
   filter(!str_detect(street, "DRIVEWAY|PED |PEDESTRIAN PATH")) %>%
   filter(l_boro == 4) 
 
