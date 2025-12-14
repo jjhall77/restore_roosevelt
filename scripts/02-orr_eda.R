@@ -1118,3 +1118,190 @@ saveRDS(list(
 ), file = here("output", "eda_objects.rds"))
 
 cat("\nKey spatial objects saved to: output/eda_objects.rds\n")
+
+
+
+
+#==============================================================================
+# 8. DISPLACEMENT ANALYSIS: TOP PROSTITUTION BLOCK GROUPS (QUEENS/BROOKLYN)
+#==============================================================================
+
+cat("\n=== PROSTITUTION HOT SPOT DISPLACEMENT ANALYSIS ===\n")
+
+# Queens = boro_code 4, Brooklyn = boro_code 3
+queens_brooklyn_bgs <- nycb %>%
+  filter(boro_code %in% c("3", "4")) %>%
+  pull(geoid) %>%
+  as.character() %>%
+  stringr::str_sub(1, 12)
+# Get top 50 prostitution arrest BGs in Queens/Brooklyn
+top_pros_bgs <- pros_bg %>%
+  
+  filter(geoid %in% queens_brooklyn_bgs) %>%
+  slice_max(n, n = 50)
+
+cat(sprintf("Top 50 prostitution BGs in Queens/Brooklyn: %d-%d arrests\n",
+            min(top_pros_bgs$n), max(top_pros_bgs$n)))
+
+# Flag which are in the zone vs outside
+top_pros_bgs <- top_pros_bgs %>%
+  mutate(in_zone = geoid %in% zone_bgs)
+
+cat(sprintf("  In zone: %d\n", sum(top_pros_bgs$in_zone)))
+cat(sprintf("  Outside zone: %d\n", sum(!top_pros_bgs$in_zone)))
+
+# Get monthly street violence in these BGs (2022+)
+top_bgs_crime <- street_violent_crime %>%
+  filter(date >= as.Date("2022-01-01")) %>%
+  st_join(nyc_bgs %>% filter(geoid %in% top_pros_bgs$geoid) %>% select(geoid)) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(geoid)) %>%
+  left_join(top_pros_bgs %>% select(geoid, in_zone, n), by = "geoid") %>%
+  rename(pros_arrests = n)
+
+# Aggregate by month and zone status
+monthly_top_bgs <- top_bgs_crime %>%
+  mutate(
+    month = floor_date(date, "month"),
+    location = if_else(in_zone, "Zone BGs", "Other Top Prostitution BGs")
+  ) %>%
+  count(month, location)
+
+# Plot
+p_displacement <- ggplot(monthly_top_bgs, aes(x = month, y = n, color = location)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  geom_vline(xintercept = op_start, linetype = "dashed", color = "black") +
+  annotate("rect", xmin = op_start, xmax = op_end, ymin = -Inf, ymax = Inf,
+           alpha = 0.1, fill = "red") +
+  labs(
+    title = "Street Violence in Top Prostitution Block Groups",
+    subtitle = "Queens/Brooklyn - Inspecting for displacement during operation",
+    x = "Month", y = "Street Violence Incidents", color = ""
+  ) +
+  scale_color_manual(values = c("Zone BGs" = "red", "Other Top Prostitution BGs" = "steelblue")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_displacement
+
+ggsave(here("output", "eda_plots", "25_prostitution_bg_displacement.png"), p_displacement,
+       width = 10, height = 6, dpi = 300)
+
+
+
+# Get monthly violent crime in these BGs (2022+)
+top_bgs_violent <- violent_crime %>%
+  filter(date >= as.Date("2022-01-01")) %>%
+  st_join(
+    nyc_bgs %>%
+      filter(geoid %in% top_pros_bgs$geoid) %>%
+      select(geoid)
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(geoid)) %>%
+  left_join(top_pros_bgs %>% select(geoid, in_zone, n), by = "geoid") %>%
+  rename(pros_arrests = n)
+
+# Aggregate by month and zone status
+monthly_top_bgs_violent <- top_bgs_violent %>%
+  mutate(
+    month = floor_date(date, "month"),
+    location = if_else(in_zone, "Zone BGs", "Other Top Prostitution BGs")
+  ) %>%
+  count(month, location)
+
+# Plot
+p_violent_displacement <- ggplot(
+  monthly_top_bgs_violent,
+  aes(x = month, y = n, color = location)
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  geom_vline(xintercept = op_start, linetype = "dashed", color = "black") +
+  annotate(
+    "rect",
+    xmin = op_start, xmax = op_end,
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.1, fill = "red"
+  ) +
+  labs(
+    title = "Violent Crime in Top Prostitution Block Groups",
+    subtitle = "Queens/Brooklyn – Inspecting for displacement during operation",
+    x = "Month",
+    y = "Violent Crime Incidents",
+    color = ""
+  ) +
+  scale_color_manual(
+    values = c(
+      "Zone BGs" = "red",
+      "Other Top Prostitution BGs" = "steelblue"
+    )
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_violent_displacement
+
+ggsave(
+  here("output", "eda_plots", "25_prostitution_bg_displacement_violent.png"),
+  p_violent_displacement,
+  width = 10, height = 6, dpi = 300
+)
+
+
+
+
+
+
+
+
+# Also look at individual BGs outside zone (faceted)
+outside_zone_bgs <- top_pros_bgs %>%
+  filter(!in_zone) %>%
+  slice_max(n, n = 12)  # Top 12 outside zone
+
+monthly_individual <- top_bgs_crime %>%
+  filter(geoid %in% outside_zone_bgs$geoid) %>%
+  mutate(month = floor_date(date, "month")) %>%
+  count(geoid, month) %>%
+  left_join(outside_zone_bgs %>% select(geoid, pros_arrests = n), by = "geoid") %>%
+  mutate(label = sprintf("%s\n(%d arrests)", geoid, pros_arrests))
+
+p_individual <- ggplot(monthly_individual, aes(x = month, y = n)) +
+  geom_line(color = "steelblue", linewidth = 0.6) +
+  geom_vline(xintercept = op_start, linetype = "dashed", color = "red", linewidth = 0.5) +
+  facet_wrap(~label, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Street Violence in Top Non-Zone Prostitution BGs",
+    subtitle = "Red dashed line = operation start",
+    x = "Month", y = "Incidents"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 7),
+    axis.text = element_text(size = 6)
+  )
+
+p_individual
+
+ggsave(here("output", "eda_plots", "26_individual_prostitution_bgs.png"), p_individual,
+       width = 12, height = 8, dpi = 300)
+
+# Quick stats
+cat("\nPre vs During Operation - Other Top Prostitution BGs:\n")
+other_bgs_comparison <- top_bgs_crime %>%
+  filter(!in_zone) %>%
+  mutate(period = case_when(
+    date >= op_start & date <= op_end ~ "During",
+    date >= op_start - 90 & date < op_start ~ "Pre (90 days)",
+    TRUE ~ "Other"
+  )) %>%
+  filter(period %in% c("During", "Pre (90 days)")) %>%
+  count(period)
+
+print(other_bgs_comparison)
+
+
+
+

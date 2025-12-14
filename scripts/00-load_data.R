@@ -446,3 +446,8 @@ glimpse(violent_crime)
 glimpse(property_crime)
 glimpse(street_violent_crime)
 glimpse(street_property_crime)
+
+
+x<- violent_crime %>%
+  st_drop_geometry() %>%
+  count(date)
