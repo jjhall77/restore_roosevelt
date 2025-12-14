@@ -7,6 +7,7 @@ library(tidyverse)
 library(janitor)
 library(lubridate)
 library(sf)
+source(here("lib","definitions.R"))
 
 #-------------------------------------------------
 # List files
@@ -44,6 +45,10 @@ nynta <- st_read(here("data", "nynta2020_25d"), quiet = TRUE) |>
   st_transform(2263) |>
   clean_names()
 
+nypp <- st_read(here("data", "nypp_25d"), quiet = TRUE) |>
+  st_transform(2263) |>
+  clean_names()
+
 #-------------------------------------------------
 # CSV reader
 #-------------------------------------------------
@@ -72,7 +77,8 @@ complaints <- bind_rows(
     mutate(housing_psa = as.character(housing_psa)),
   read_clean_csv("NYPD_Complaint_Data_Current_(Year_To_Date)_20251214.csv") |>
     mutate(housing_psa = as.character(housing_psa))
-)
+) %>%
+  filter(!pd_cd %in% c(111,113,114))
 
 criminal_court_summons <- read_clean_csv("NYPD_Criminal_Court_Summons_(Historic)_20251214.csv")
 
@@ -355,6 +361,88 @@ all_summonses <- bind_rows(oath, rosie_cs) |>
   mutate(date = mdy(summons_date))
 
 
+#create crime data:
+violent_ky  <- c(101, 104, 105, 106, 344)
+property_ky <- c(107, 109, 110)
+
+outside_loc_keywords <- c(
+  "FRONT OF","OPPOSITE OF","OUTSIDE","REAR OF",
+  "STREET","IN STREET","SIDEWALK"
+)
+
+outside_prem_keywords <- c(
+  "PARK","STREET","PUBLIC PLACE","HIGHWAY",
+  "BRIDGE","SIDEWALK","VACANT LOT",
+  "PUBLIC HOUSING AREA","OUTSIDE"
+)
+
+# Flag "street" (outdoor)
+compl_street <- complaints_sf %>%
+  mutate(
+    date = mdy(rpt_dt),
+    loc_of_occur_desc = str_to_upper(coalesce(loc_of_occur_desc, "")),
+    prem_typ_desc     = str_to_upper(coalesce(prem_typ_desc, "")),
+    is_outdoor =
+      str_detect(loc_of_occur_desc, str_c(outside_loc_keywords, collapse = "|")) |
+      str_detect(prem_typ_desc,     str_c(outside_prem_keywords, collapse = "|"))
+  )
+
+# 4 objects
+violent_crime <- complaints_sf %>%
+  filter(ky_cd %in% violent_ky) %>%
+  mutate(date = mdy(rpt_dt))
+
+property_crime <- complaints_sf %>%
+  filter(ky_cd %in% property_ky) %>%
+  mutate(date = mdy(rpt_dt))
+
+street_violent_crime <- compl_street %>%
+  filter(is_outdoor, jurisdiction_code != 1, ky_cd %in% violent_ky)
+
+street_property_crime <- compl_street %>%
+  filter(is_outdoor, jurisdiction_code != 1, ky_cd %in% property_ky)
 
 
 
+# Core spatial objects
+glimpse(lion)
+glimpse(nycb)
+glimpse(nyct)
+glimpse(nynta)
+glimpse(nypp)
+
+# Raw tabular data
+glimpse(arrests)
+glimpse(directed_patrols)
+glimpse(complaints)
+glimpse(criminal_court_summons)
+glimpse(oath_summons)
+glimpse(precincts)
+
+# sf versions
+glimpse(arrests_sf)
+glimpse(directed_patrols_sf)
+glimpse(complaints_sf)
+glimpse(criminal_court_summons_sf)
+glimpse(oath_summons_sf)
+glimpse(precincts_sf)
+
+# Roads / zone objects
+glimpse(roads_filtered)
+glimpse(roosevelt_roads)
+glimpse(roosevelt_roads_limited)
+glimpse(rosie_buffer)
+
+# Census geography
+glimpse(nyc_bgs)
+
+# Summonses combined
+glimpse(rosie_cs)
+glimpse(oath)
+glimpse(all_summonses)
+
+# Crime classification outputs
+glimpse(violent_crime)
+glimpse(property_crime)
+glimpse(street_violent_crime)
+glimpse(street_property_crime)
