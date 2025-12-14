@@ -1,7 +1,7 @@
 #-------------------------------------------------
 # 00 — Load data + make sf versions (EPSG:2263)
 #-------------------------------------------------
-
+options(scipen=999)
 library(here)
 library(tidyverse)
 library(janitor)
@@ -451,3 +451,45 @@ glimpse(street_property_crime)
 x<- violent_crime %>%
   st_drop_geometry() %>%
   count(date)
+
+
+
+
+# helper: summarize areas (sq mi)
+area_stats <- function(x, name) {
+  x <- st_make_valid(x)
+  a <- st_area(x) |> units::set_units("mi^2") |> units::drop_units()
+  
+  tibble(
+    geography = name,
+    n_features = nrow(x),
+    total_area_sq_mi = sum(a, na.rm = TRUE),
+    mean_area_sq_mi  = mean(a, na.rm = TRUE),
+    median_area_sq_mi = median(a, na.rm = TRUE),
+    min_area_sq_mi   = min(a, na.rm = TRUE),
+    max_area_sq_mi   = max(a, na.rm = TRUE)
+  )
+}
+
+# rosie buffer area (sq mi)
+rosie_area_sq_mi <- rosie_buffer |>
+  st_make_valid() |>
+  st_area() |>
+  units::set_units("mi^2") |>
+  units::drop_units()
+
+# stats table
+geo_stats <- bind_rows(
+  area_stats(nycb,    "nycb (boroughs)"),
+  area_stats(nyct,    "nyct (tracts)"),
+  area_stats(nyc_bgs, "nyc_bgs (block groups)"),
+  area_stats(nynta,   "nynta (NTAs)"),
+  area_stats(nypp,    "nypp (precinct polygons)")
+) |>
+  mutate(
+    rosie_buffer_area_sq_mi = rosie_area_sq_mi,
+    rosie_as_pct_of_total = 100 * rosie_buffer_area_sq_mi / total_area_sq_mi,
+    approx_units_to_cover_rosie = rosie_buffer_area_sq_mi / mean_area_sq_mi
+  )
+
+geo_stats
