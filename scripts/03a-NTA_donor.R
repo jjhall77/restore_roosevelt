@@ -1,13 +1,12 @@
+#03a- causal analysis for NTA's
 #==============================================================================
-# Operation Restore Roosevelt - Causal Analysis (Final Version)
+# Operation Restore Roosevelt - Causal Analysis (NTA Version)
 # 
 # Primary Method: gsynth (generalized synthetic control with factor model)
 # Robustness: Synthetic DiD, Augmented SCM
 # 
-# Unit of analysis: Census Tracts (donors) vs Zone (rosie_buffer aggregate)
-# Note: Zone is ~5-10x larger than individual tracts, so methods that
-#       require level-matching (pure SC) will fail. gsynth handles this
-#       via interactive fixed effects.
+# Unit of analysis: NTAs (donors) vs Zone (rosie_buffer aggregate)
+# NTAs are larger than tracts, providing better scale match with zone.
 #==============================================================================
 
 library(here)
@@ -17,7 +16,6 @@ library(sf)
 library(gsynth)
 library(synthdid)
 library(augsynth)
-library(panelView)
 library(future)
 library(furrr)
 library(patchwork)
@@ -28,7 +26,7 @@ plan(multisession, workers = n_workers)
 cat(sprintf("Using %d parallel workers\n", n_workers))
 
 # Create output directory
-dir.create(here("output", "causal_tract"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("output", "causal_nta"), showWarnings = FALSE, recursive = TRUE)
 
 #==============================================================================
 # 1. PARAMETERS AND DATA LOADING
@@ -44,6 +42,31 @@ if (file.exists(here("output", "eda_objects.rds"))) {
   stop("Run EDA scripts first to generate eda_objects.rds")
 }
 
+# Load NTA shapefile if not already loaded
+# Adjust path as needed - check what you have available
+if (!exists("nynta")) {
+  # Try common locations
+  if (file.exists(here("data", "nynta.shp"))) {
+    nynta <- st_read(here("data", "nynta.shp")) %>% st_transform(2263)
+  } else if (file.exists(here("data", "nynta2020.shp"))) {
+    nynta <- st_read(here("data", "nynta2020.shp")) %>% st_transform(2263)
+  } else {
+    stop("NTA shapefile not found. Please load nynta manually.")
+  }
+}
+
+# Check NTA ID column name - adapt as needed
+nta_id_col <- intersect(c("ntacode", "nta2020", "ntaname", "NTACode", "NTA2020"), names(nynta))[1]
+if (is.na(nta_id_col)) {
+  
+  cat("Available NTA columns:", paste(names(nynta), collapse = ", "), "\n")
+  stop("Cannot find NTA ID column. Please set nta_id_col manually.")
+}
+cat(sprintf("Using NTA ID column: %s\n", nta_id_col))
+
+# Rename for consistency
+nynta <- nynta %>% rename(nta_id = all_of(nta_id_col))
+
 # Key dates
 op_start <- as.Date("2024-10-15")
 op_end <- op_start + 89
@@ -51,7 +74,7 @@ treatment_month <- floor_date(op_start, "month")  # 2024-10-01
 
 # Analysis window
 data_start <- as.Date("2022-01-01")
-data_end <- as.Date("2025-09-01")  # Last complete month
+data_end <- as.Date("2025-09-30")  # Last complete month
 
 all_months <- seq(data_start, data_end, by = "month")
 n_months <- length(all_months)
@@ -61,26 +84,28 @@ n_post <- n_months - n_pre
 cat(sprintf("Analysis window: %s to %s\n", data_start, data_end))
 cat(sprintf("Treatment month: %s\n", treatment_month))
 cat(sprintf("Periods: %d total (%d pre, %d post)\n", n_months, n_pre, n_post))
+cat(sprintf("Total NTAs in NYC: %d\n", nrow(nynta)))
 
 #==============================================================================
-# 2. IDENTIFY ZONE AND DONOR TRACTS
+# 2. IDENTIFY ZONE AND DONOR NTAs
 #==============================================================================
 
 cat("\n=== IDENTIFYING TREATMENT AND DONOR UNITS ===\n")
 
-# Tracts that intersect the zone = excluded from donors
-zone_tracts <- nyct %>%
+# NTAs that intersect the zone = excluded from donors
+zone_ntas <- nynta %>%
   st_filter(rosie_buffer, .predicate = st_intersects) %>%
-  pull(boro_ct2020)
+  pull(nta_id)
 
-cat(sprintf("Tracts intersecting zone (excluded): %d\n", length(zone_tracts)))
+cat(sprintf("NTAs intersecting zone (excluded): %d\n", length(zone_ntas)))
+cat("  ", paste(zone_ntas, collapse = ", "), "\n")
 
-# Donor pool: all tracts NOT intersecting zone
-donor_tracts <- nyct %>%
-  filter(!boro_ct2020 %in% zone_tracts) %>%
-  pull(boro_ct2020)
+# Donor pool: all NTAs NOT intersecting zone
+donor_ntas <- nynta %>%
+  filter(!nta_id %in% zone_ntas) %>%
+  pull(nta_id)
 
-cat(sprintf("Potential donor tracts: %d\n", length(donor_tracts)))
+cat(sprintf("Potential donor NTAs: %d\n", length(donor_ntas)))
 
 #==============================================================================
 # 3. BUILD PANEL DATA
@@ -88,17 +113,17 @@ cat(sprintf("Potential donor tracts: %d\n", length(donor_tracts)))
 
 cat("\n=== BUILDING PANEL DATA ===\n")
 
-# Monthly street violent crime by tract (for donors)
-street_violent_tract <- street_violent_crime %>%
+# Monthly street violent crime by NTA (for donors)
+street_violent_nta <- street_violent_crime %>%
   filter(date >= data_start) %>%
-  st_join(nyct %>% select(boro_ct2020)) %>%
+  st_join(nynta %>% select(nta_id)) %>%
   st_drop_geometry() %>%
-  filter(!is.na(boro_ct2020)) %>%
+  filter(!is.na(nta_id)) %>%
   mutate(month = floor_date(date, "month")) %>%
   filter(month <= data_end) %>%
-  count(boro_ct2020, month, name = "crime_count")
+  count(nta_id, month, name = "crime_count")
 
-# Zone aggregate: crimes within rosie_buffer (not tract-based)
+# Zone aggregate: crimes within rosie_buffer (not NTA-based)
 zone_monthly <- street_violent_crime %>%
   filter(date >= data_start) %>%
   st_filter(rosie_buffer, .predicate = st_intersects) %>%
@@ -108,7 +133,7 @@ zone_monthly <- street_violent_crime %>%
   count(month, name = "crime_count") %>%
   right_join(tibble(month = all_months), by = "month") %>%
   replace_na(list(crime_count = 0)) %>%
-  mutate(boro_ct2020 = "ZONE") %>%
+  mutate(nta_id = "ZONE") %>%
   arrange(month)
 
 cat(sprintf("\nZone monthly crime: mean=%.1f, sd=%.1f, range=%d-%d\n",
@@ -119,16 +144,16 @@ cat(sprintf("\nZone monthly crime: mean=%.1f, sd=%.1f, range=%d-%d\n",
 
 # Complete donor panel
 donor_panel <- expand_grid(
-  boro_ct2020 = donor_tracts,
+  nta_id = donor_ntas,
   month = all_months
 ) %>%
-  left_join(street_violent_tract, by = c("boro_ct2020", "month")) %>%
+  left_join(street_violent_nta, by = c("nta_id", "month")) %>%
   replace_na(list(crime_count = 0))
 
 # Donor statistics
 donor_stats <- donor_panel %>%
   filter(month < treatment_month) %>%
-  group_by(boro_ct2020) %>%
+  group_by(nta_id) %>%
   summarize(
     mean_crime = mean(crime_count),
     total_crime = sum(crime_count),
@@ -136,10 +161,16 @@ donor_stats <- donor_panel %>%
     .groups = "drop"
   )
 
-cat(sprintf("Donor tract monthly crime: mean=%.1f, median=%.1f, max=%.1f\n",
+cat(sprintf("Donor NTA monthly crime: mean=%.1f, median=%.1f, max=%.1f\n",
             mean(donor_stats$mean_crime),
             median(donor_stats$mean_crime),
             max(donor_stats$mean_crime)))
+
+# Compare scale
+cat(sprintf("\nScale comparison:\n"))
+cat(sprintf("  Zone mean: %.1f crimes/month\n", mean(zone_monthly$crime_count)))
+cat(sprintf("  Donor NTA mean: %.1f crimes/month\n", mean(donor_stats$mean_crime)))
+cat(sprintf("  Ratio: %.1fx\n", mean(zone_monthly$crime_count) / mean(donor_stats$mean_crime)))
 
 #==============================================================================
 # 4. FILTER DONOR POOL
@@ -147,20 +178,19 @@ cat(sprintf("Donor tract monthly crime: mean=%.1f, median=%.1f, max=%.1f\n",
 
 cat("\n=== FILTERING DONOR POOL ===\n")
 
-# Remove tracts with very little crime (too sparse for estimation)
-# Keep tracts with at least some activity
-min_total_crime <- 10
-min_nonzero_months <- n_pre * 0.3  # At least 30% non-zero months
+# For NTAs, we can be less aggressive with filtering since they're larger
+min_total_crime <- 20
+min_nonzero_months <- n_pre * 0.5  # At least 50% non-zero months
 
 good_donors <- donor_stats %>%
   filter(
     total_crime >= min_total_crime,
     nonzero_months >= min_nonzero_months
   ) %>%
-  pull(boro_ct2020)
+  pull(nta_id)
 
 cat(sprintf("Donors after filtering: %d (from %d)\n", 
-            length(good_donors), length(donor_tracts)))
+            length(good_donors), length(donor_ntas)))
 cat(sprintf("  Min total crime: %d\n", min_total_crime))
 cat(sprintf("  Min non-zero months: %.0f (%.0f%%)\n", 
             min_nonzero_months, min_nonzero_months/n_pre*100))
@@ -173,7 +203,7 @@ cat("\n=== BUILDING FINAL PANEL ===\n")
 
 # Combine zone and donors
 panel_final <- donor_panel %>%
-  filter(boro_ct2020 %in% good_donors) %>%
+  filter(nta_id %in% good_donors) %>%
   mutate(tag = "donor") %>%
   bind_rows(
     zone_monthly %>% mutate(tag = "treated")
@@ -183,17 +213,17 @@ panel_final <- donor_panel %>%
     log_crime = log(crime_count + 0.5),
     post = month >= treatment_month
   ) %>%
-  arrange(boro_ct2020, month)
+  arrange(nta_id, month)
 
 # Verify balanced panel
-n_units <- n_distinct(panel_final$boro_ct2020)
+n_units <- n_distinct(panel_final$nta_id)
 n_periods <- n_distinct(panel_final$month)
 
 cat(sprintf("Final panel: %d units × %d periods = %d rows\n",
             n_units, n_periods, nrow(panel_final)))
 
 # Check balance
-balance_check <- panel_final %>% count(boro_ct2020) %>% pull(n) %>% unique()
+balance_check <- panel_final %>% count(nta_id) %>% pull(n) %>% unique()
 if (length(balance_check) == 1) {
   cat("✓ Panel is balanced\n")
 } else {
@@ -220,9 +250,7 @@ p_zone <- ggplot(zone_monthly, aes(x = month, y = crime_count)) +
   ) +
   theme_minimal()
 
-p_zone
-
-ggsave(here("output", "causal_tract", "00_zone_time_series.png"), p_zone,
+ggsave(here("output", "causal_nta", "00_zone_time_series.png"), p_zone,
        width = 10, height = 6, dpi = 300)
 
 # Zone vs donor distribution
@@ -256,8 +284,8 @@ p_comparison <- ggplot() +
                                 "Donor Median" = "steelblue",
                                 "Donor 90th %ile" = "gray50")) +
   labs(
-    title = "Zone vs Donor Tracts",
-    subtitle = "Zone is aggregated corridor; donors are individual tracts (note scale difference)",
+    title = "Zone vs Donor NTAs",
+    subtitle = "NTAs provide better scale match than census tracts",
     x = "Month", y = "Crime Count", color = ""
   ) +
   theme_minimal() +
@@ -265,13 +293,10 @@ p_comparison <- ggplot() +
 
 p_comparison
 
-ggsave(here("output", "causal_tract", "01_zone_vs_donors.png"), p_comparison,
+ggsave(here("output", "causal_nta", "01_zone_vs_donors.png"), p_comparison,
        width = 10, height = 6, dpi = 300)
 
-# Treatment pattern visualization
-# Treatment pattern visualization - simple version
-# (panelview struggles with single treated unit)
-
+# Treatment pattern
 p_treatment_pattern <- panel_final %>%
   mutate(
     status = case_when(
@@ -288,16 +313,15 @@ p_treatment_pattern <- panel_final %>%
                                "Treated (Pre)" = "steelblue",
                                "Treated (Post)" = "darkred")) +
   labs(
-    title = "Treatment Pattern",
-    subtitle = "1 treated unit (Zone), rest are donors",
+    title = "Treatment Pattern (NTA Level)",
+    subtitle = "1 treated unit (Zone), rest are donor NTAs",
     x = "Month", y = "Number of Units", fill = ""
   ) +
   theme_minimal() +
   theme(legend.position = "bottom")
-
 p_treatment_pattern
 
-ggsave(here("output", "causal_tract", "02_treatment_pattern.png"), 
+ggsave(here("output", "causal_nta", "02_treatment_pattern.png"), 
        p_treatment_pattern, width = 10, height = 6, dpi = 300)
 
 #==============================================================================
@@ -306,23 +330,25 @@ ggsave(here("output", "causal_tract", "02_treatment_pattern.png"),
 
 cat("\n=== GSYNTH (PRIMARY METHOD) ===\n")
 cat("Using generalized synthetic control with interactive fixed effects.\n")
-cat("This method handles level differences between zone and individual tracts.\n\n")
+cat("NTAs provide better scale match than census tracts.\n\n")
 
 results <- list()
 
 # Helper function to safely extract SE from gsynth
 get_gsynth_se <- function(gs_obj) {
-  # Try different locations where SE might be stored
-  if (!is.null(gs_obj$est.avg)) {
-    # Newer gsynth versions store it here
-    return(gs_obj$est.avg[, "S.E."])
-  } else if (!is.null(gs_obj$att.avg.se)) {
-    return(gs_obj$att.avg.se)
-  } else if (!is.null(gs_obj$att.avg.var) && is.numeric(gs_obj$att.avg.var) && length(gs_obj$att.avg.var) == 1) {
-    return(sqrt(gs_obj$att.avg.var))
-  } else {
-    return(NA)
+  if (is.null(gs_obj)) return(NA_real_)
+  if (!is.null(gs_obj$est.avg) && is.matrix(gs_obj$est.avg)) {
+    if ("S.E." %in% colnames(gs_obj$est.avg)) {
+      return(gs_obj$est.avg[1, "S.E."])
+    }
   }
+  if (!is.null(gs_obj$att.avg.se) && is.numeric(gs_obj$att.avg.se) && length(gs_obj$att.avg.se) == 1) {
+    return(gs_obj$att.avg.se)
+  }
+  if (!is.null(gs_obj$att.avg.var) && is.numeric(gs_obj$att.avg.var) && length(gs_obj$att.avg.var) == 1) {
+    return(sqrt(gs_obj$att.avg.var))
+  }
+  return(NA_real_)
 }
 
 # --- Raw counts ---
@@ -332,7 +358,7 @@ tryCatch({
   gs_raw <- gsynth(
     crime_count ~ treat,
     data      = panel_final,
-    index     = c("boro_ct2020", "month"),
+    index     = c("nta_id", "month"),
     force     = "two-way",
     CV        = TRUE,
     r         = c(0, 5),
@@ -356,21 +382,19 @@ tryCatch({
   }
   results$gs_raw_se <- se_raw
   
-  # Counterfactual plot
-  png(here("output", "causal_tract", "03_gsynth_raw_counterfactual.png"),
+  # Plots
+  png(here("output", "causal_nta", "03_gsynth_raw_counterfactual.png"),
       width = 10, height = 6, units = "in", res = 300)
   plot(gs_raw, type = "counterfactual", raw = "none",
        main = "Gsynth: Treated vs Synthetic Control (Raw Counts)")
   dev.off()
   
-  # Gap plot
-  png(here("output", "causal_tract", "04_gsynth_raw_gap.png"),
+  png(here("output", "causal_nta", "04_gsynth_raw_gap.png"),
       width = 10, height = 6, units = "in", res = 300)
   plot(gs_raw, type = "gap", main = "Gsynth: Treatment Effect Over Time")
   dev.off()
   
-  # CT plot
-  png(here("output", "causal_tract", "05_gsynth_raw_att.png"),
+  png(here("output", "causal_nta", "05_gsynth_raw_att.png"),
       width = 10, height = 6, units = "in", res = 300)
   plot(gs_raw, type = "ct", main = "Gsynth: Average Treatment Effect")
   dev.off()
@@ -388,7 +412,7 @@ tryCatch({
   gs_log <- gsynth(
     log_crime ~ treat,
     data      = panel_final,
-    index     = c("boro_ct2020", "month"),
+    index     = c("nta_id", "month"),
     force     = "two-way",
     CV        = TRUE,
     r         = c(0, 5),
@@ -412,13 +436,13 @@ tryCatch({
   cat(sprintf("  Approx %% change: %.1f%%\n", (exp(gs_log$att.avg) - 1) * 100))
   results$gs_log_se <- se_log
   
-  png(here("output", "causal_tract", "06_gsynth_log_counterfactual.png"),
+  png(here("output", "causal_nta", "06_gsynth_log_counterfactual.png"),
       width = 10, height = 6, units = "in", res = 300)
   plot(gs_log, type = "counterfactual", raw = "none",
        main = "Gsynth: Treated vs Synthetic Control (Log Counts)")
   dev.off()
   
-  png(here("output", "causal_tract", "07_gsynth_log_gap.png"),
+  png(here("output", "causal_nta", "07_gsynth_log_gap.png"),
       width = 10, height = 6, units = "in", res = 300)
   plot(gs_log, type = "gap", main = "Gsynth: Treatment Effect Over Time (Log)")
   dev.off()
@@ -428,17 +452,15 @@ tryCatch({
 }, error = function(e) {
   cat(sprintf("Gsynth (log) failed: %s\n", e$message))
 })
+
 #==============================================================================
 # 8. ROBUSTNESS: SYNTHETIC DIFF-IN-DIFF
 #==============================================================================
 
 cat("\n=== SYNTHETIC DIFF-IN-DIFF (ROBUSTNESS) ===\n")
-cat("Note: SDID uses differencing which mitigates level mismatch.\n")
-cat("The plot may look poor but the estimate can still be valid.\n\n")
 
-# Prepare matrices for synthdid
-# Select subset of donors for computational feasibility
-n_donors_sdid <- min(200, length(good_donors))
+# With NTAs we have fewer units, so use all of them
+n_donors_sdid <- length(good_donors)
 
 # Select by pre-treatment correlation with zone
 zone_pre <- zone_monthly %>%
@@ -448,7 +470,7 @@ zone_pre <- zone_monthly %>%
 
 donor_cors <- panel_final %>%
   filter(tag == "donor", month < treatment_month) %>%
-  group_by(boro_ct2020) %>%
+  group_by(nta_id) %>%
   arrange(month) %>%
   summarize(
     series = list(crime_count),
@@ -460,23 +482,23 @@ donor_cors <- panel_final %>%
   filter(!is.na(cor_zone)) %>%
   slice_max(cor_zone, n = n_donors_sdid)
 
-sdid_donors <- donor_cors$boro_ct2020
+sdid_donors <- donor_cors$nta_id
 
-cat(sprintf("Using %d donors for SDID (top correlated)\n", length(sdid_donors)))
+cat(sprintf("Using %d donors for SDID\n", length(sdid_donors)))
 
 # Build matrix
 panel_sdid <- panel_final %>%
-  filter(boro_ct2020 == "ZONE" | boro_ct2020 %in% sdid_donors)
+  filter(nta_id == "ZONE" | nta_id %in% sdid_donors)
 
 panel_wide_raw <- panel_sdid %>%
-  select(boro_ct2020, month, crime_count) %>%
+  select(nta_id, month, crime_count) %>%
   pivot_wider(names_from = month, values_from = crime_count, values_fill = 0) %>%
-  column_to_rownames("boro_ct2020")
+  column_to_rownames("nta_id")
 
 panel_wide_log <- panel_sdid %>%
-  select(boro_ct2020, month, log_crime) %>%
+  select(nta_id, month, log_crime) %>%
   pivot_wider(names_from = month, values_from = log_crime, values_fill = log(0.5)) %>%
-  column_to_rownames("boro_ct2020")
+  column_to_rownames("nta_id")
 
 # Reorder: controls first, treated last
 prepare_matrix <- function(wide_df) {
@@ -508,7 +530,7 @@ tryCatch({
   cat(sprintf("95%% CI: [%.2f, %.2f]\n", 
               sdid_raw - 1.96*se_raw, sdid_raw + 1.96*se_raw))
   
-  png(here("output", "causal_tract", "08_sdid_raw.png"),
+  png(here("output", "causal_nta", "08_sdid_raw.png"),
       width = 10, height = 6, units = "in", res = 300)
   synthdid_plot(sdid_raw, se.method = "placebo")
   dev.off()
@@ -530,7 +552,7 @@ tryCatch({
   cat(sprintf("SDID estimate (log): %.3f (SE: %.3f)\n", sdid_log, se_log))
   cat(sprintf("Approx %% change: %.1f%%\n", (exp(sdid_log) - 1) * 100))
   
-  png(here("output", "causal_tract", "09_sdid_log.png"),
+  png(here("output", "causal_nta", "09_sdid_log.png"),
       width = 10, height = 6, units = "in", res = 300)
   synthdid_plot(sdid_log, se.method = "placebo")
   dev.off()
@@ -539,7 +561,7 @@ tryCatch({
   cat(sprintf("SDID (log) failed: %s\n", e$message))
 })
 
-# --- Standard SC and DiD for comparison ---
+# --- Standard SC and DiD ---
 cat("\nFitting SC and DiD for comparison...\n")
 
 tryCatch({
@@ -561,12 +583,10 @@ tryCatch({
 #==============================================================================
 
 cat("\n=== AUGMENTED SYNTHETIC CONTROL (ROBUSTNESS) ===\n")
-cat("Ridge augmentation corrects for imperfect pre-treatment fit.\n\n")
 
-# Use same donor subset as SDID
 augsynth_data <- panel_sdid %>%
   mutate(
-    unit = boro_ct2020,
+    unit = nta_id,
     time = as.integer(factor(month))
   )
 
@@ -593,12 +613,10 @@ tryCatch({
               ascm_raw_summ$average_att$Std.Error))
   
   p_ascm_raw <- plot(ascm_raw) +
-    labs(title = "Augmented SCM (Raw Counts)") +
+    labs(title = "Augmented SCM (Raw Counts) - NTA") +
     theme_minimal()
   
-  p_ascm_raw
-  
-  ggsave(here("output", "causal_tract", "10_ascm_raw.png"), p_ascm_raw,
+  ggsave(here("output", "causal_nta", "10_ascm_raw.png"), p_ascm_raw,
          width = 10, height = 6, dpi = 300)
   
 }, error = function(e) {
@@ -628,12 +646,10 @@ tryCatch({
               ascm_log_summ$average_att$Std.Error))
   
   p_ascm_log <- plot(ascm_log) +
-    labs(title = "Augmented SCM (Log Counts)") +
+    labs(title = "Augmented SCM (Log Counts) - NTA") +
     theme_minimal()
   
-  p_ascm_log
-  
-  ggsave(here("output", "causal_tract", "11_ascm_log.png"), p_ascm_log,
+  ggsave(here("output", "causal_nta", "11_ascm_log.png"), p_ascm_log,
          width = 10, height = 6, dpi = 300)
   
 }, error = function(e) {
@@ -646,10 +662,6 @@ tryCatch({
 
 cat("\n=== RESULTS SUMMARY ===\n")
 
-# Helper function to safely extract gsynth SE
-
-
-# Build results table
 results_table <- tibble(
   Method = character(),
   Scale = character(),
@@ -660,38 +672,13 @@ results_table <- tibble(
   Pct_Change = numeric()
 )
 
-# Helper function to safely extract gsynth SE
-get_gsynth_se <- function(gs_obj) {
-  if (is.null(gs_obj)) return(NA_real_)
-  
-  # Try est.avg matrix first (newer gsynth) - uses row index 1, not "ATT.avg"
-  if (!is.null(gs_obj$est.avg) && is.matrix(gs_obj$est.avg)) {
-    if ("S.E." %in% colnames(gs_obj$est.avg)) {
-      return(gs_obj$est.avg[1, "S.E."])
-    }
-  }
-  
-  # Try att.avg.se
-  if (!is.null(gs_obj$att.avg.se) && is.numeric(gs_obj$att.avg.se) && length(gs_obj$att.avg.se) == 1) {
-    return(gs_obj$att.avg.se)
-  }
-  
-  # Try att.avg.var (if it's a single number)
-  if (!is.null(gs_obj$att.avg.var) && is.numeric(gs_obj$att.avg.var) && length(gs_obj$att.avg.var) == 1) {
-    return(sqrt(gs_obj$att.avg.var))
-  }
-  
-  return(NA_real_)
-}
-
 # Gsynth raw
 if (!is.null(results$gs_raw)) {
   est <- results$gs_raw$att.avg
   se <- get_gsynth_se(results$gs_raw)
   results_table <- results_table %>%
     add_row(Method = "Gsynth", Scale = "Raw",
-            Estimate = est, 
-            SE = se,
+            Estimate = est, SE = se,
             CI_lower = if (!is.na(se)) est - 1.96*se else NA_real_,
             CI_upper = if (!is.na(se)) est + 1.96*se else NA_real_,
             Pct_Change = NA_real_)
@@ -703,22 +690,19 @@ if (!is.null(results$gs_log)) {
   se <- get_gsynth_se(results$gs_log)
   results_table <- results_table %>%
     add_row(Method = "Gsynth", Scale = "Log",
-            Estimate = est, 
-            SE = se,
+            Estimate = est, SE = se,
             CI_lower = if (!is.na(se)) est - 1.96*se else NA_real_,
             CI_upper = if (!is.na(se)) est + 1.96*se else NA_real_,
             Pct_Change = (exp(est) - 1) * 100)
 }
 
-print(results_table, n = 20)
 # SDID raw
 if (!is.null(results$sdid_raw)) {
   est <- as.numeric(results$sdid_raw)
   se <- if (!is.null(results$sdid_raw_se)) as.numeric(results$sdid_raw_se) else NA_real_
   results_table <- results_table %>%
     add_row(Method = "Synthetic DiD", Scale = "Raw",
-            Estimate = est, 
-            SE = se,
+            Estimate = est, SE = se,
             CI_lower = if (!is.na(se)) est - 1.96*se else NA_real_,
             CI_upper = if (!is.na(se)) est + 1.96*se else NA_real_,
             Pct_Change = NA_real_)
@@ -730,8 +714,7 @@ if (!is.null(results$sdid_log)) {
   se <- if (!is.null(results$sdid_log_se)) as.numeric(results$sdid_log_se) else NA_real_
   results_table <- results_table %>%
     add_row(Method = "Synthetic DiD", Scale = "Log",
-            Estimate = est, 
-            SE = se,
+            Estimate = est, SE = se,
             CI_lower = if (!is.na(se)) est - 1.96*se else NA_real_,
             CI_upper = if (!is.na(se)) est + 1.96*se else NA_real_,
             Pct_Change = (exp(est) - 1) * 100)
@@ -745,8 +728,7 @@ if (!is.null(results$ascm_raw)) {
   se <- if (!is.null(se) && is.numeric(se)) as.numeric(se) else NA_real_
   results_table <- results_table %>%
     add_row(Method = "Augmented SCM", Scale = "Raw",
-            Estimate = est, 
-            SE = se,
+            Estimate = est, SE = se,
             CI_lower = if (!is.na(se)) est - 1.96*se else NA_real_,
             CI_upper = if (!is.na(se)) est + 1.96*se else NA_real_,
             Pct_Change = NA_real_)
@@ -760,95 +742,78 @@ if (!is.null(results$ascm_log)) {
   se <- if (!is.null(se) && is.numeric(se)) as.numeric(se) else NA_real_
   results_table <- results_table %>%
     add_row(Method = "Augmented SCM", Scale = "Log",
-            Estimate = est, 
-            SE = se,
+            Estimate = est, SE = se,
             CI_lower = if (!is.na(se)) est - 1.96*se else NA_real_,
             CI_upper = if (!is.na(se)) est + 1.96*se else NA_real_,
             Pct_Change = (exp(est) - 1) * 100)
 }
 
-# SC (no SE - and note this estimate is unreliable due to level mismatch)
+# SC and DiD
 if (!is.null(results$sc_raw)) {
   results_table <- results_table %>%
     add_row(Method = "Synthetic Control*", Scale = "Raw",
-            Estimate = as.numeric(results$sc_raw), 
-            SE = NA_real_,
-            CI_lower = NA_real_, 
-            CI_upper = NA_real_, 
-            Pct_Change = NA_real_)
+            Estimate = as.numeric(results$sc_raw), SE = NA_real_,
+            CI_lower = NA_real_, CI_upper = NA_real_, Pct_Change = NA_real_)
 }
 
-# DiD (no SE)
 if (!is.null(results$did_raw)) {
   results_table <- results_table %>%
     add_row(Method = "Diff-in-Diff", Scale = "Raw",
-            Estimate = as.numeric(results$did_raw), 
-            SE = NA_real_,
-            CI_lower = NA_real_, 
-            CI_upper = NA_real_, 
-            Pct_Change = NA_real_)
+            Estimate = as.numeric(results$did_raw), SE = NA_real_,
+            CI_lower = NA_real_, CI_upper = NA_real_, Pct_Change = NA_real_)
 }
 
-# Print results
 cat("\n")
 print(results_table, n = 20)
 
-cat("\n* Synthetic Control estimate unreliable due to level mismatch between zone and tract donors.\n")
+cat("\n* Synthetic Control may be unreliable if level mismatch persists.\n")
 
-# Check what's there
-results$gs_raw$att.avg  # Should be a number
-results$gs_raw$est.avg  # Might have SE here
+write_csv(results_table, here("output", "causal_nta", "results_summary.csv"))
 
-# Save results
-write_csv(results_table, here("output", "causal_tract", "results_summary.csv"))
 #==============================================================================
 # 11. FOREST PLOT
 #==============================================================================
 
 cat("\n=== GENERATING PLOTS ===\n")
 
-# Forest plot - Raw scale
 p_forest_raw <- results_table %>%
   filter(Scale == "Raw", !is.na(SE)) %>%
   ggplot(aes(x = Estimate, y = reorder(Method, Estimate))) +
   geom_point(size = 3) +
-  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.2) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper)) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
   labs(
-    title = "Treatment Effect Estimates (Raw Scale)",
+    title = "Treatment Effect Estimates (Raw Scale) - NTA Level",
     subtitle = "Point estimates with 95% CI",
-    x = "Estimated Effect (change in monthly crime count)", 
-    y = ""
+    x = "Estimated Effect (change in monthly crime count)", y = ""
   ) +
   theme_minimal()
 
 p_forest_raw
 
-ggsave(here("output", "causal_tract", "12_forest_plot_raw.png"), p_forest_raw,
+ggsave(here("output", "causal_nta", "12_forest_plot_raw.png"), p_forest_raw,
        width = 10, height = 5, dpi = 300)
 
-# Forest plot - Log scale
 p_forest_log <- results_table %>%
   filter(Scale == "Log", !is.na(SE)) %>%
   ggplot(aes(x = Estimate, y = reorder(Method, Estimate))) +
   geom_point(size = 3) +
-  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.2) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper)) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
   labs(
-    title = "Treatment Effect Estimates (Log Scale)",
-    subtitle = sprintf("Point estimates with 95%% CI. Negative = crime reduction."),
-    x = "Estimated Effect (log scale)", 
-    y = ""
+    title = "Treatment Effect Estimates (Log Scale) - NTA Level",
+    subtitle = "Point estimates with 95% CI. Negative = crime reduction.",
+    x = "Estimated Effect (log scale)", y = ""
   ) +
   theme_minimal()
 
 p_forest_log
 
-ggsave(here("output", "causal_tract", "13_forest_plot_log.png"), p_forest_log,
+ggsave(here("output", "causal_nta", "13_forest_plot_log.png"), p_forest_log,
        width = 10, height = 5, dpi = 300)
 
 #==============================================================================
-# 12. PRE-TREATMENT FIT DIAGNOSTICS (GSYNTH) - FIXED
+# 12. PRE-TREATMENT FIT DIAGNOSTICS
 #==============================================================================
 
 cat("\n=== PRE-TREATMENT FIT DIAGNOSTICS ===\n")
@@ -856,16 +821,12 @@ cat("\n=== PRE-TREATMENT FIT DIAGNOSTICS ===\n")
 if (!is.null(results$gs_raw)) {
   
   gs <- results$gs_raw
-  
-  # Get ATT and time
   att <- gs$att
   rel_time <- gs$time
   
-  # Map relative time to actual dates
   unique_months <- sort(unique(panel_final$month))
   treatment_index <- which(unique_months == treatment_month)
   
-  # Create dataframe
   att_df <- tibble(
     relative_period = rel_time,
     ATT = att,
@@ -873,7 +834,6 @@ if (!is.null(results$gs_raw)) {
   ) %>%
     mutate(period = if_else(relative_period < 0, "Pre-treatment", "Post-treatment"))
   
-  # Add SE and CI from est.att if available
   if (!is.null(gs$est.att)) {
     att_df <- att_df %>%
       mutate(
@@ -884,7 +844,6 @@ if (!is.null(results$gs_raw)) {
       )
   }
   
-  # Pre-treatment diagnostics
   pre_att <- att_df %>% filter(period == "Pre-treatment")
   post_att <- att_df %>% filter(period == "Post-treatment")
   
@@ -895,9 +854,7 @@ if (!is.null(results$gs_raw)) {
   
   cat(sprintf("\nPost-treatment periods: %d\n", nrow(post_att)))
   cat(sprintf("Post-treatment ATT mean: %.2f\n", mean(post_att$ATT)))
-  cat(sprintf("Post-treatment ATT range: [%.2f, %.2f]\n", min(post_att$ATT), max(post_att$ATT)))
   
-  # Plot ATT over time
   p_att_time <- ggplot(att_df, aes(x = month, y = ATT)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
     {if ("CI_lower" %in% names(att_df)) 
@@ -905,81 +862,44 @@ if (!is.null(results$gs_raw)) {
     geom_line(linewidth = 0.8) +
     geom_point(aes(color = period), size = 2) +
     geom_vline(xintercept = treatment_month, linetype = "dashed") +
+    annotate("rect", xmin = op_start, xmax = op_end, ymin = -Inf, ymax = Inf,
+             alpha = 0.1, fill = "red") +
     scale_color_manual(values = c("Pre-treatment" = "gray50", "Post-treatment" = "darkred")) +
     labs(
-      title = "Gsynth: Treatment Effect by Period",
-      subtitle = "Pre-treatment ATT should be ~0 if model fits well. Large pre-treatment variation = caution.",
+      title = "Gsynth: Treatment Effect by Period (NTA Level)",
+      subtitle = "Pre-treatment ATT should be ~0 if model fits well",
       x = "Month", y = "ATT (Treated - Counterfactual)", color = ""
     ) +
     theme_minimal() +
     theme(legend.position = "bottom")
+  
   p_att_time
   
-  ggsave(here("output", "causal_tract", "14_att_by_period.png"), p_att_time,
+  ggsave(here("output", "causal_nta", "14_att_by_period.png"), p_att_time,
          width = 10, height = 6, dpi = 300)
   
-  # Save data
-  write_csv(att_df, here("output", "causal_tract", "gsynth_att_by_period.csv"))
+  write_csv(att_df, here("output", "causal_nta", "gsynth_att_by_period.csv"))
   
-  cat("\nPlot saved: 14_att_by_period.png\n")
-  
-  # Interpretation warning
   pre_rmse <- sqrt(mean(pre_att$ATT^2))
+  pre_rmse
   cat(sprintf("\nPre-treatment RMSE: %.2f\n", pre_rmse))
-  
-  if (pre_rmse > 20) {
-    cat("\n⚠️  WARNING: Pre-treatment RMSE is high (>20).\n")
-    cat("   This suggests imperfect pre-treatment fit.\n")
-    cat("   The post-treatment ATT should be interpreted with caution.\n")
-    cat("   However, gsynth is designed to handle this via factor modeling.\n")
-  }
 }
-#==============================================================================
-# 13. INTERPRETATION GUIDANCE
-#==============================================================================
-
-cat("\n")
-cat("================================================================\n")
-cat("INTERPRETATION GUIDANCE\n")
-cat("================================================================\n")
-
-cat("
-PRIMARY RESULTS (Gsynth):
-- Gsynth uses interactive fixed effects which absorb level differences
-  between the aggregated zone and individual tract donors.
-- The counterfactual plot should show good pre-treatment fit.
-- Negative ATT = crime reduction in zone relative to counterfactual.
-
-ROBUSTNESS CHECKS:
-- SDID: Uses differencing which mitigates level mismatch. The visual
-  plot may look poor but the estimate can still be valid.
-- ASCM: Ridge augmentation corrects for imperfect SCM fit.
-- If all methods agree on direction, that's reassuring.
-- If they disagree, investigate why and report with caveats.
-
-CAVEATS:
-- Pre-intervention spike may bias results (regression to mean).
-- Zone is geographically unique (el train + commercial corridor).
-- No perfect donor exists; we're constructing a weighted counterfactual.
-
-")
 
 #==============================================================================
-# 14. SAVE ALL RESULTS
+# 13. SAVE RESULTS
 #==============================================================================
 
-saveRDS(results, here("output", "causal_tract", "all_results.rds"))
-saveRDS(panel_final, here("output", "causal_tract", "panel_final.rds"))
+saveRDS(results, here("output", "causal_nta", "all_results.rds"))
+saveRDS(panel_final, here("output", "causal_nta", "panel_final.rds"))
 
-# Clean up parallel
 plan(sequential)
 
 cat("\n================================================================\n")
-cat("ANALYSIS COMPLETE\n")
+cat("NTA-LEVEL ANALYSIS COMPLETE\n")
 cat("================================================================\n")
-cat(sprintf("\nOutputs saved to: %s\n", here("output", "causal_tract")))
+cat(sprintf("\nOutputs saved to: %s\n", here("output", "causal_nta")))
 
-list.files(here("output", "causal_tract")) %>%
+list.files(here("output", "causal_nta")) %>%
   paste(" -", .) %>%
   cat(sep = "\n")
 
