@@ -1,3 +1,5 @@
+#smaller buffers
+
 #==============================================================================
 # Operation Restore Roosevelt - FINAL Causal Analysis
 # 
@@ -66,61 +68,72 @@ cat(sprintf("Periods: %d total (%d pre, %d post)\n", n_months, n_pre, n_post))
 
 cat("\n=== DEFINING GEOGRAPHIC UNITS ===\n")
 
-# --- Zone NTAs (excluded from donors) ---
+# --- Treatment Zone ---
+# Crimes within rosie_buffer (unchanged)
+cat("Treatment zone: rosie_buffer\n")
+
+# --- Spatial Spillover: Direct buffer donut (NOT NTA-based) ---
+spillover_distance <- 2640  # 0.5 mile in feet
+spatial_buffer <- rosie_buffer %>%
+  st_buffer(spillover_distance) %>%
+  st_difference(rosie_buffer)  # Donut shape
+
+cat(sprintf("Spatial spillover: %.2f sq mi buffer donut\n", 
+            as.numeric(st_area(spatial_buffer)) / 27878400))  # sq ft to sq mi
+
+# --- Thematic Spillover: High-prostitution BGs (NOT NTAs) ---
+# Prostitution arrests by BG
+prostitution_arrests <- arrests_sf %>%
+  filter(date >= data_start, date < treatment_month) %>%
+  filter(arrest_boro %in% c("Q", "K")) %>%
+  filter(str_detect(law_code, "PL 230"))
+
+pros_by_bg <- prostitution_arrests %>%
+  st_join(nyc_bgs %>% select(geoid)) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(geoid)) %>%
+  count(geoid, name = "pros_arrests") %>%
+  arrange(desc(pros_arrests))
+
+cat(sprintf("Prostitution arrests in Q/K: %d\n", nrow(prostitution_arrests)))
+cat("\nTop 10 prostitution BGs:\n")
+print(head(pros_by_bg, 10))
+
+# Identify BGs that overlap with zone or spatial buffer (to exclude)
+zone_bgs <- nyc_bgs %>%
+  st_filter(rosie_buffer, .predicate = st_intersects) %>%
+  pull(geoid)
+
+buffer_bgs <- nyc_bgs %>%
+  st_filter(spatial_buffer, .predicate = st_intersects) %>%
+  pull(geoid)
+
+# High-prostitution BGs (5+ arrests), excluding zone and buffer
+thematic_spillover_bgs <- pros_by_bg %>%
+  filter(pros_arrests >= 5) %>%
+  filter(!geoid %in% c(zone_bgs, buffer_bgs)) %>%
+  pull(geoid)
+
+cat(sprintf("Thematic spillover BGs: %d high-prostitution BGs\n", length(thematic_spillover_bgs)))
+
+# Create combined geometry for thematic spillover
+thematic_spillover_area <- nyc_bgs %>%
+  filter(geoid %in% thematic_spillover_bgs) %>%
+  st_union()
+
+# --- Identify NTAs that intersect zone (for reference) ---
 zone_ntas <- nynta %>%
   st_filter(rosie_buffer, .predicate = st_intersects) %>%
   pull(nta_id)
 
-cat(sprintf("Zone NTAs (excluded): %d\n", length(zone_ntas)))
+cat(sprintf("NTAs intersecting zone (for reference): %d\n", length(zone_ntas)))
 
-# --- Spatial spillover buffer (0.5 mile donut around zone) ---
-spillover_distance <- 2640  # feet
-spatial_buffer <- rosie_buffer %>%
-  st_buffer(spillover_distance) %>%
-  st_difference(rosie_buffer)
-
-spatial_spillover_ntas <- nynta %>%
-  st_filter(spatial_buffer, .predicate = st_intersects) %>%
-  filter(!nta_id %in% zone_ntas) %>%
-  pull(nta_id)
-
-cat(sprintf("Spatial spillover NTAs: %d\n", length(spatial_spillover_ntas)))
-
-# --- Thematic spillover: Prostitution hot spots (Queens/Brooklyn) ---
-# Using arrest data with PL 230 (prostitution penal code)
-prostitution_arrests <- arrests_sf %>%
-  filter(date >= data_start, date < treatment_month) %>%
-  filter(arrest_boro %in% c("Q", "K")) %>%  # Queens, Brooklyn
-  
-  filter(str_detect(law_code, "PL 230"))
-
-pros_by_nta <- prostitution_arrests %>%
-  st_join(nynta %>% select(nta_id)) %>%
-  st_drop_geometry() %>%
-  filter(!is.na(nta_id)) %>%
-  count(nta_id, name = "pros_arrests") %>%
-  arrange(desc(pros_arrests))
-
-cat(sprintf("Prostitution arrests in Q/K: %d\n", nrow(prostitution_arrests)))
-cat("\nTop prostitution NTAs:\n")
-print(head(pros_by_nta, 10))
-
-# Top prostitution NTAs (5+ arrests, excluding zone and spatial spillover)
-thematic_spillover_ntas <- pros_by_nta %>%
-  filter(pros_arrests >= 5) %>%
-  filter(!nta_id %in% c(zone_ntas, spatial_spillover_ntas)) %>%
-  pull(nta_id)
-
-cat(sprintf("Thematic spillover NTAs: %d\n", length(thematic_spillover_ntas)))
-
-# --- Donor pool (all others) ---
-all_excluded <- unique(c(zone_ntas, spatial_spillover_ntas, thematic_spillover_ntas))
-
+# --- Donor NTAs ---
+# All NTAs are potential donors; we'll subtract crimes from excluded areas
 donor_ntas <- nynta %>%
-  filter(!nta_id %in% all_excluded) %>%
   pull(nta_id)
 
-cat(sprintf("Donor NTAs: %d\n", length(donor_ntas)))
+cat(sprintf("Potential donor NTAs: %d (will subtract excluded area crimes)\n", length(donor_ntas)))
 
 #==============================================================================
 # 3. BUILD PANEL DATA
@@ -128,31 +141,7 @@ cat(sprintf("Donor NTAs: %d\n", length(donor_ntas)))
 
 cat("\n=== BUILDING PANEL DATA ===\n")
 
-# Crime by NTA
-crime_by_nta <- violent_crime %>%
-  filter(date >= data_start) %>%
-  st_join(nynta %>% select(nta_id)) %>%
-  st_drop_geometry() %>%
-  filter(!is.na(nta_id)) %>%
-  mutate(month = floor_date(date, "month")) %>%
-  filter(month <= data_end) %>%
-  count(nta_id, month, name = "crime_count")
-
-# Helper function to build aggregated panel
-build_panel <- function(nta_ids, unit_name) {
-  if (length(nta_ids) == 0) return(NULL)
-  
-  crime_by_nta %>%
-    filter(nta_id %in% nta_ids) %>%
-    group_by(month) %>%
-    summarize(crime_count = sum(crime_count), .groups = "drop") %>%
-    right_join(tibble(month = all_months), by = "month") %>%
-    replace_na(list(crime_count = 0)) %>%
-    mutate(nta_id = unit_name) %>%
-    arrange(month)
-}
-
-# Build panels for each unit type
+# --- Zone panel: crimes within rosie_buffer ---
 zone_panel <- street_violent_crime %>%
   filter(date >= data_start) %>%
   st_filter(rosie_buffer, .predicate = st_intersects) %>%
@@ -165,10 +154,89 @@ zone_panel <- street_violent_crime %>%
   mutate(nta_id = "ZONE") %>%
   arrange(month)
 
-spatial_panel <- build_panel(spatial_spillover_ntas, "SPATIAL_SPILLOVER")
-thematic_panel <- build_panel(thematic_spillover_ntas, "THEMATIC_SPILLOVER")
+cat(sprintf("Zone monthly crime: mean=%.1f, range=%d-%d\n",
+            mean(zone_panel$crime_count),
+            min(zone_panel$crime_count),
+            max(zone_panel$crime_count)))
 
-# Donor panel (individual NTAs)
+# --- Spatial spillover panel: crimes within buffer donut ---
+spatial_panel <- street_violent_crime %>%
+  filter(date >= data_start) %>%
+  st_filter(spatial_buffer, .predicate = st_intersects) %>%
+  st_drop_geometry() %>%
+  mutate(month = floor_date(date, "month")) %>%
+  filter(month <= data_end) %>%
+  count(month, name = "crime_count") %>%
+  right_join(tibble(month = all_months), by = "month") %>%
+  replace_na(list(crime_count = 0)) %>%
+  mutate(nta_id = "SPATIAL_SPILLOVER") %>%
+  arrange(month)
+
+cat(sprintf("Spatial spillover monthly crime: mean=%.1f, range=%d-%d\n",
+            mean(spatial_panel$crime_count),
+            min(spatial_panel$crime_count),
+            max(spatial_panel$crime_count)))
+
+# --- Thematic spillover panel: crimes within high-prostitution BGs ---
+thematic_panel <- street_violent_crime %>%
+  filter(date >= data_start) %>%
+  st_filter(thematic_spillover_area, .predicate = st_intersects) %>%
+  st_drop_geometry() %>%
+  mutate(month = floor_date(date, "month")) %>%
+  filter(month <= data_end) %>%
+  count(month, name = "crime_count") %>%
+  right_join(tibble(month = all_months), by = "month") %>%
+  replace_na(list(crime_count = 0)) %>%
+  mutate(nta_id = "THEMATIC_SPILLOVER") %>%
+  arrange(month)
+
+cat(sprintf("Thematic spillover monthly crime: mean=%.1f, range=%d-%d\n",
+            mean(thematic_panel$crime_count),
+            min(thematic_panel$crime_count),
+            max(thematic_panel$crime_count)))
+
+# --- Identify crimes to exclude from donor pool ---
+cat("\nIdentifying crimes in excluded areas...\n")
+
+crimes_in_zone <- street_violent_crime %>%
+  filter(date >= data_start) %>%
+  st_filter(rosie_buffer, .predicate = st_intersects) %>%
+  pull(cmplnt_num)
+
+crimes_in_buffer <- street_violent_crime %>%
+  filter(date >= data_start) %>%
+  st_filter(spatial_buffer, .predicate = st_intersects) %>%
+  pull(cmplnt_num)
+
+crimes_in_thematic <- street_violent_crime %>%
+  filter(date >= data_start) %>%
+  st_filter(thematic_spillover_area, .predicate = st_intersects) %>%
+  pull(cmplnt_num)
+
+excluded_crimes <- unique(c(crimes_in_zone, crimes_in_buffer, crimes_in_thematic))
+
+cat(sprintf("Crimes excluded from donor pool:\n"))
+cat(sprintf("  Zone: %d\n", length(crimes_in_zone)))
+cat(sprintf("  Spatial buffer: %d\n", length(crimes_in_buffer)))
+cat(sprintf("  Thematic BGs: %d\n", length(crimes_in_thematic)))
+cat(sprintf("  Total unique excluded: %d\n", length(excluded_crimes)))
+
+# --- Build donor panel: NTA-level crimes EXCLUDING zone, buffer, and thematic areas ---
+# Tag each crime with its NTA
+crime_with_nta <- street_violent_crime %>%
+  filter(date >= data_start) %>%
+  st_join(nynta %>% select(nta_id)) %>%
+  mutate(month = floor_date(date, "month")) %>%
+  filter(month <= data_end)
+
+# Count crimes by NTA, excluding those in zone/buffer/thematic areas
+crime_by_nta <- crime_with_nta %>%
+  st_drop_geometry() %>%
+  filter(!is.na(nta_id)) %>%
+  filter(!cmplnt_num %in% excluded_crimes) %>%
+  count(nta_id, month, name = "crime_count")
+
+# Create complete panel
 donor_panel <- expand_grid(nta_id = donor_ntas, month = all_months) %>%
   left_join(crime_by_nta, by = c("nta_id", "month")) %>%
   replace_na(list(crime_count = 0))
@@ -180,6 +248,7 @@ donor_stats <- donor_panel %>%
   summarize(
     total_crime = sum(crime_count),
     nonzero_months = sum(crime_count > 0),
+    mean_crime = mean(crime_count),
     .groups = "drop"
   )
 
@@ -187,16 +256,16 @@ good_donors <- donor_stats %>%
   filter(total_crime >= 20, nonzero_months >= n_pre * 0.5) %>%
   pull(nta_id)
 
-cat(sprintf("Filtered donors: %d (from %d)\n", length(good_donors), length(donor_ntas)))
+cat(sprintf("\nFiltered donors: %d NTAs (from %d)\n", length(good_donors), length(donor_ntas)))
 
 # Summary stats
 cat(sprintf("\nMonthly crime means:\n"))
 cat(sprintf("  Zone: %.1f\n", mean(zone_panel$crime_count)))
-cat(sprintf("  Spatial spillover: %.1f\n", mean(spatial_panel$crime_count)))
-cat(sprintf("  Thematic spillover: %.1f\n", mean(thematic_panel$crime_count)))
-cat(sprintf("  Donor NTAs (median): %.1f\n", median(donor_stats$total_crime / n_pre)))
-
-#==============================================================================
+cat(sprintf("  Spatial spillover (buffer): %.1f\n", mean(spatial_panel$crime_count)))
+cat(sprintf("  Thematic spillover (pros BGs): %.1f\n", mean(thematic_panel$crime_count)))
+cat(sprintf("  Donor NTAs (median): %.1f\n", 
+            median(donor_stats %>% filter(nta_id %in% good_donors) %>% pull(mean_crime))))
+#=======================================================
 # 4. HELPER FUNCTIONS
 #==============================================================================
 
@@ -778,8 +847,12 @@ cat("\n=== CREATING INTERACTIVE MAP ===\n")
 
 # Transform to WGS84 for leaflet
 nynta_wgs <- nynta %>% st_transform(4326)
+nyc_bgs_wgs <- nyc_bgs %>% st_transform(4326)
 zone_wgs <- rosie_buffer %>% st_transform(4326)
 spatial_buffer_wgs <- spatial_buffer %>% st_transform(4326)
+thematic_bgs_wgs <- nyc_bgs %>% 
+  filter(geoid %in% thematic_spillover_bgs) %>% 
+  st_transform(4326)
 
 # --- Extract SDID weights ---
 if (sdid_zone$success) {
@@ -796,44 +869,62 @@ if (sdid_zone$success) {
   print(head(sdid_weights, 10))
 }
 
-# --- Extract Gsynth weights ---
+# --- Extract Gsynth weights (if available) ---
+# --- Extract Gsynth weights (if available) ---
+gsynth_weights <- tibble(nta_id = character(), gsynth_weight = numeric())
+
 if (gs_zone$success) {
   gs <- gs_zone$object
   
-  # Gsynth uses factor loadings, not simple weights
-  # The "implied weights" show how much each donor contributes
+  # Check what's available
+  cat("Gsynth weight objects available:\n")
+  cat("  wgt.implied:", !is.null(gs$wgt.implied), "\n")
+  
   if (!is.null(gs$wgt.implied)) {
-    gsynth_weights <- tibble(
-      nta_id = rownames(gs$wgt.implied),
-      gsynth_weight = as.vector(gs$wgt.implied)
-    ) %>%
-      filter(nta_id != "ZONE") %>%
-      arrange(desc(gsynth_weight))
+    # Check structure
+    cat("  Class:", class(gs$wgt.implied), "\n")
+    cat("  Length:", length(gs$wgt.implied), "\n")
     
-    cat("\nTop 10 Gsynth implied weights:\n")
-    print(head(gsynth_weights, 10))
+    # Get names - might be names() or rownames() depending on structure
+    weight_names <- if (!is.null(rownames(gs$wgt.implied))) {
+      rownames(gs$wgt.implied)
+    } else if (!is.null(names(gs$wgt.implied))) {
+      names(gs$wgt.implied)
+    } else {
+      NULL
+    }
+    
+    if (!is.null(weight_names)) {
+      gsynth_weights <- tibble(
+        nta_id = weight_names,
+        gsynth_weight = as.vector(gs$wgt.implied)
+      )
+      
+      gsynth_weights <- gsynth_weights %>%
+        filter(nta_id != "ZONE") %>%
+        arrange(desc(gsynth_weight))
+      
+      cat("\nTop 10 Gsynth implied weights:\n")
+      print(head(gsynth_weights, 10))
+    } else {
+      cat("  Could not extract weight names from gsynth object\n")
+    }
   }
 }
 
 # --- Combine weights with NTA geometry ---
 nta_map_data <- nynta_wgs %>%
   left_join(sdid_weights, by = "nta_id") %>%
-  left_join(
-    if (exists("gsynth_weights")) gsynth_weights else tibble(nta_id = character(), gsynth_weight = numeric()),
-    by = "nta_id"
-  ) %>%
+  left_join(gsynth_weights, by = "nta_id") %>%
   mutate(
-    # Classify each NTA
+    # Classify each NTA (now just donors or not)
     unit_type = case_when(
-      nta_id %in% zone_ntas ~ "Zone (Treated)",
-      nta_id %in% spatial_spillover_ntas ~ "Spatial Spillover",
-      nta_id %in% thematic_spillover_ntas ~ "Thematic Spillover",
       nta_id %in% good_donors ~ "Donor",
       TRUE ~ "Excluded"
     ),
     # Weight category for donors
     weight_cat = case_when(
-      unit_type != "Donor" ~ unit_type,
+      unit_type != "Donor" ~ "Excluded",
       sdid_weight >= 0.05 ~ "High Weight (≥5%)",
       sdid_weight >= 0.01 ~ "Medium Weight (1-5%)",
       sdid_weight > 0 ~ "Low Weight (<1%)",
@@ -843,80 +934,111 @@ nta_map_data <- nynta_wgs %>%
     popup_label = paste0(
       "<b>", nta_name, "</b><br>",
       "NTA: ", nta_id, "<br>",
-      "Type: ", unit_type, "<br>",
-      if_else(!is.na(sdid_weight), 
+      "Borough: ", boro_name, "<br>",
+      if_else(!is.na(sdid_weight) & sdid_weight > 0, 
               paste0("SDID Weight: ", scales::percent(sdid_weight, accuracy = 0.1), "<br>"),
               ""),
-      if_else(!is.na(gsynth_weight),
+      if_else(!is.na(gsynth_weight) & gsynth_weight > 0,
               paste0("Gsynth Weight: ", scales::percent(gsynth_weight, accuracy = 0.1)),
               "")
     )
   )
 
-# --- Color palette ---
-pal <- colorFactor(
-  palette = c("darkred", "steelblue", "forestgreen", "orange", "gold", "lightyellow", "gray90"),
-  levels = c("Zone (Treated)", "Spatial Spillover", "Thematic Spillover", 
-             "High Weight (≥5%)", "Medium Weight (1-5%)", "Low Weight (<1%)", "Zero Weight")
+# --- Add prostitution arrest info to thematic BGs ---
+thematic_bgs_map <- thematic_bgs_wgs %>%
+  left_join(pros_by_bg, by = "geoid") %>%
+  mutate(
+    popup_label = paste0(
+      "<b>Thematic Spillover BG</b><br>",
+      "GEOID: ", geoid, "<br>",
+      "Prostitution Arrests: ", pros_arrests
+    )
+  )
+
+# --- Color palettes ---
+pal_donors <- colorFactor(
+  palette = c("orange", "gold", "lightyellow", "gray90", "gray95"),
+  levels = c("High Weight (≥5%)", "Medium Weight (1-5%)", "Low Weight (<1%)", "Zero Weight", "Excluded")
 )
 
 # --- Create leaflet map ---
 map <- leaflet() %>%
   addProviderTiles(providers$CartoDB.Positron) %>%
   
-  # Add NTAs colored by weight/type
+  # Add donor NTAs colored by weight
   addPolygons(
-    data = nta_map_data %>% filter(unit_type != "Excluded"),
-    fillColor = ~pal(weight_cat),
-    fillOpacity = 0.6,
+    data = nta_map_data %>% filter(unit_type == "Donor"),
+    fillColor = ~pal_donors(weight_cat),
+    fillOpacity = 0.5,
     color = "white",
     weight = 1,
     popup = ~popup_label,
     label = ~nta_name,
-    group = "NTAs"
+    group = "Donor NTAs"
   ) %>%
   
-  # Add treatment zone boundary
+  # Add treatment zone
   addPolygons(
     data = zone_wgs,
     fillColor = "darkred",
-    fillOpacity = 0.3,
+    fillOpacity = 0.5,
     color = "darkred",
     weight = 3,
     label = "Treatment Zone (rosie_buffer)",
-    group = "Zone"
+    popup = paste0(
+      "<b>Treatment Zone</b><br>",
+      "Mean monthly crime: ", round(mean(zone_panel$crime_count), 1)
+    ),
+    group = "Treatment Zone"
   ) %>%
   
-  # Add spatial spillover buffer outline
+  # Add spatial spillover buffer (donut)
   addPolygons(
     data = spatial_buffer_wgs,
-    fillColor = NA,
-    fillOpacity = 0,
+    fillColor = "steelblue",
+    fillOpacity = 0.4,
     color = "steelblue",
     weight = 2,
-    dashArray = "5,5",
-    label = "Spatial Spillover Buffer",
-    group = "Spillover Buffer"
+    label = "Spatial Spillover Buffer (0.5 mi)",
+    popup = paste0(
+      "<b>Spatial Spillover Buffer</b><br>",
+      "0.5 mile donut around zone<br>",
+      "Mean monthly crime: ", round(mean(spatial_panel$crime_count), 1)
+    ),
+    group = "Spatial Spillover"
+  ) %>%
+  
+  # Add thematic spillover BGs
+  addPolygons(
+    data = thematic_bgs_map,
+    fillColor = "forestgreen",
+    fillOpacity = 0.5,
+    color = "forestgreen",
+    weight = 2,
+    popup = ~popup_label,
+    label = ~paste("Prostitution BG:", geoid),
+    group = "Thematic Spillover (Prostitution BGs)"
   ) %>%
   
   # Add legend
   addLegend(
     position = "bottomright",
-    pal = pal,
-    values = c("Zone (Treated)", "Spatial Spillover", "Thematic Spillover",
-               "High Weight (≥5%)", "Medium Weight (1-5%)", "Low Weight (<1%)", "Zero Weight"),
-    title = "NTA Type / Weight",
+    colors = c("darkred", "steelblue", "forestgreen", "orange", "gold", "lightyellow", "gray90"),
+    labels = c("Treatment Zone", "Spatial Spillover Buffer", "Thematic Spillover BGs",
+               "Donor: High Weight (≥5%)", "Donor: Medium (1-5%)", "Donor: Low (<1%)", "Donor: Zero Weight"),
+    title = "Map Legend",
     opacity = 0.8
   ) %>%
   
   # Layer controls
   addLayersControl(
-    overlayGroups = c("NTAs", "Zone", "Spillover Buffer"),
+    overlayGroups = c("Donor NTAs", "Treatment Zone", "Spatial Spillover", "Thematic Spillover (Prostitution BGs)"),
     options = layersControlOptions(collapsed = FALSE)
   ) %>%
   
-  # Set view to Queens
-  setView(lng = -73.85, lat = 40.75, zoom = 11)
+  # Set view to Queens/Roosevelt Ave area
+  
+  setView(lng = -73.85, lat = 40.75, zoom = 12)
 
 # Display map
 map
@@ -937,7 +1059,7 @@ top_donors_table <- nta_map_data %>%
   arrange(desc(sdid_weight)) %>%
   head(20)
 
-print(top_donors_table, n = 20)
+print(top_donors_table)
 
 write_csv(top_donors_table, here("output", "causal_final", "top_donors.csv"))
 
@@ -957,3 +1079,39 @@ boro_weights <- nta_map_data %>%
   arrange(desc(total_weight))
 
 print(boro_weights)
+
+# --- Thematic spillover BGs summary ---
+cat("\n=== THEMATIC SPILLOVER BGs ===\n")
+
+# Use countyfp directly (005=Bronx, 047=Brooklyn, 061=Manhattan, 081=Queens, 085=Staten Island)
+thematic_summary <- pros_by_bg %>%
+  filter(geoid %in% thematic_spillover_bgs) %>%
+  left_join(
+    nyc_bgs %>% st_drop_geometry() %>% select(geoid, countyfp),
+    by = "geoid"
+  ) %>%
+  mutate(
+    boro_name = case_when(
+      countyfp == "005" ~ "Bronx",
+      countyfp == "047" ~ "Brooklyn",
+      countyfp == "061" ~ "Manhattan",
+      countyfp == "081" ~ "Queens",
+      countyfp == "085" ~ "Staten Island",
+      TRUE ~ "Unknown"
+    )
+  )
+
+cat(sprintf("Total thematic spillover BGs: %d\n", length(thematic_spillover_bgs)))
+cat(sprintf("Total prostitution arrests in these BGs: %d\n", sum(thematic_summary$pros_arrests)))
+
+cat("\nBy borough:\n")
+thematic_summary %>%
+  group_by(boro_name) %>%
+  summarize(
+    n_bgs = n(),
+    total_arrests = sum(pros_arrests),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_arrests)) %>%
+  print()
+
